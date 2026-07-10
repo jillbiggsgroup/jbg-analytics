@@ -3,6 +3,15 @@
 -- recency decay and event-type weighting into a scalar engagement intensity
 -- plus a top-500 array of decayed-weight event details for the matcher to
 -- score attribute overlap against. See spec §6.
+--
+-- Tried and reverted (2026-07-10): dividing engagement_intensity by
+-- LN(1 + days since first in-window event) to counter new-contact bias.
+-- Confirmed against real data to backfire -- LN(1+d) < 1 for d = 0 or 1, so
+-- dividing by it *inflated* same-day/next-day contacts' scores instead of
+-- discounting them, and for longer-tenured people it cut their score more
+-- than it cut genuinely-new ones, since it scales with days since first
+-- observed event rather than actual account age. See match_listing_with_names.sql
+-- for the account-age-based approach that replaced it.
 
 CREATE OR REPLACE VIEW `jbg-analytics.matching.vw_person_fingerprints` AS
 WITH weighted_events AS (

@@ -3,6 +3,21 @@
 -- the FUB people mirror so results come back as names, not just IDs.
 --
 -- Confirmed dataset/table (2026-07-08): jbg-fub-mirror.fub_mirror_people.mirror_people_raw_latest
+-- Confirmed field (2026-07-10): p.data.created is an ISO-8601 FUB contact
+-- creation timestamp, e.g. "2025-01-19T04:18:31Z".
+--
+-- New-contact ramp (2026-07-10): a brand-new contact's first events are
+-- always undecayed in vw_person_fingerprints, so a burst of high-weight
+-- events within their first session (Felix AI Handoff, Property Inquiry,
+-- etc.) could outscore a longer-tenured contact whose comparable activity
+-- had partially decayed -- confirmed against real data (contacts 0-1 days
+-- old jumping thousands of ranks). Unlike a decay-based fix, this uses
+-- actual account age (p.data.created), not event history, since a genuinely
+-- new contact can rack up several events in one session and any
+-- event-count/history-depth gate would miss that. account_age_ramp linearly
+-- scales engagement_intensity from 0 to full weight over their first
+-- ACCOUNT_AGE_GRACE_DAYS days, then applies no further penalty -- so it only
+-- damps the first-session burst, not tenure in general.
 
 -- Parameters (set these before running):
 -- @target_price      INT64
@@ -14,7 +29,10 @@
 -- @target_has_parking BOOL
 -- @limit             INT64         -- e.g. 25
 
-WITH exploded AS (
+WITH constants AS (
+  SELECT 3.0 AS account_age_grace_days  -- days for a new contact to reach full weight
+),
+exploded AS (
   SELECT
     fp.person_id,
     fp.engagement_intensity,
@@ -100,26 +118,39 @@ matches AS (
     ps.attribute_overlap,
     ps.n_matching_events,
     ps.engagement_intensity,
-    ps.attribute_overlap * LN(1 + ps.engagement_intensity) AS match_score,
+    -- Ramp: 0 at account creation -> 1.0 once account_age_grace_days old.
+    -- Missing/unparseable created date fails open (ramp = 1.0) rather than
+    -- zeroing out a person's score for a data gap.
+    COALESCE(
+      LEAST(1.0, GREATEST(
+        TIMESTAMP_DIFF(
+          CURRENT_TIMESTAMP(),
+          SAFE_CAST(JSON_VALUE(p.data, '$.created') AS TIMESTAMP),
+          DAY
+        ) / c.account_age_grace_days,
+        0.0
+      )),
+      1.0
+    ) AS account_age_ramp,
     JSON_VALUE(p.data, '$.firstName')  AS first_name,
     JSON_VALUE(p.data, '$.lastName')   AS last_name,
     JSON_VALUE(p.data, '$.stage')      AS stage,
     JSON_VALUE(p.data, '$.assignedTo') AS assigned_agent
   FROM person_scores ps
+  CROSS JOIN constants c
   LEFT JOIN `jbg-fub-mirror.fub_mirror_people.mirror_people_raw_latest` p
     ON JSON_VALUE(p.data, '$.id') = ps.person_id
-  WHERE LOWER(COALESCE(JSON_VALUE(p.data, '$.stage'), '')) != 'trash'
+  WHERE LOWER(COALESCE(JSON_VALUE(p.data, '$.stage'), '')) NOT IN (
+    'trash', 'lead', 'attempted contact', 'under contract'
+  )
 )
 SELECT
-  person_id,
+  attribute_overlap * LN(1 + engagement_intensity * account_age_ramp) AS match_score,
   first_name,
   last_name,
   stage,
   assigned_agent,
-  match_score,
-  attribute_overlap,
-  n_matching_events,
-  engagement_intensity
+  CONCAT('https://jillkbiggs.followupboss.com/2/people/view/', person_id) AS profile_url
 FROM matches
 ORDER BY match_score DESC
 LIMIT @limit;
