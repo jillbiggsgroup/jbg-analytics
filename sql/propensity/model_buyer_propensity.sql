@@ -33,32 +33,43 @@
 -- it's set once at lead creation and doesn't change over the lead's
 -- lifecycle, so it doesn't carry this same forward-leak risk.
 --
--- training_examples_snapshot itself doesn't need to be rebuilt for this --
--- it already has the stage column; only the CREATE MODEL SELECT below
--- changes, so this is a straight retrain from the existing snapshot.
-
+-- is_eval column added (2026-07-16): vw_training_examples has ~46 rows per
+-- person (one per weekly as_of_date in the label spine). The previous
+-- RANDOM split assigned rows to train/eval independently, so the SAME
+-- person's different weekly snapshots could land on both sides -- the
+-- model could partially recognize a person's behavior pattern from their
+-- OTHER weeks in training, inflating eval metrics without truly
+-- generalizing to unseen people (group/panel leakage, distinct from the
+-- stage leakage above). is_eval hashes on person_id alone (not
+-- person_id+as_of_date), so every row for a given person always lands on
+-- the same side of the split. FARM_FINGERPRINT is deterministic, so this
+-- split is stable across reruns of this snapshot -- rerunning training
+-- doesn't reshuffle who's in eval.
 CREATE OR REPLACE TABLE `jbg-analytics.propensity.training_examples_snapshot` AS
-SELECT *
+SELECT
+  *,
+  MOD(ABS(FARM_FINGERPRINT(person_id)), 100) < 20 AS is_eval
 FROM `jbg-analytics.propensity.vw_training_examples`;
 
--- data_split_method (2026-07-16): switched from AUTO_SPLIT to an explicit
--- RANDOM split w/ a fixed eval fraction. AUTO_SPLIT trained fine (see
--- ML.TRAINING_INFO -- eval_loss converged normally from 0.466 to 0.077 over
--- 16 iterations) but didn't leave behind an official held-out set for
--- ML.EVALUATE / ML.CONFUSION_MATRIX to use (distinct from the internal
--- early-stopping validation slice that produces TRAINING_INFO's eval_loss
--- column). Forcing RANDOM + data_split_eval_fraction guarantees ML.EVALUATE
--- has real held-out data to score against.
+-- data_split_method (2026-07-16, updated): CUSTOM + data_split_col='is_eval'
+-- instead of RANDOM. Two things this fixes at once: (1) the person-level
+-- leakage above, since is_eval is fixed per-person, and (2) it makes the
+-- held-out rows directly queryable (WHERE is_eval) for follow-up analysis
+-- ML.EVALUATE's summary metrics don't cover -- precision@top-N and a
+-- properly-integrated PR-AUC, see eval_precision_recall.sql. is_eval itself
+-- is passed into the training SELECT below (BQML requires the split column
+-- present in the input) but isn't treated as a feature.
 CREATE OR REPLACE MODEL `jbg-analytics.propensity.model_buyer_propensity`
 OPTIONS (
   model_type = 'BOOSTED_TREE_CLASSIFIER',
   input_label_cols = ['label'],
   auto_class_weights = TRUE,
-  data_split_method = 'RANDOM',
-  data_split_eval_fraction = 0.2
+  data_split_method = 'CUSTOM',
+  data_split_col = 'is_eval'
 ) AS
 SELECT
   label,
+  is_eval,
   days_since_created,
   source,
   events_30d,
