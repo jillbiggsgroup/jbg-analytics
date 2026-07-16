@@ -18,6 +18,25 @@
 -- scales engagement_intensity from 0 to full weight over their first
 -- ACCOUNT_AGE_GRACE_DAYS days, then applies no further penalty -- so it only
 -- damps the first-session burst, not tenure in general.
+--
+-- Comms recency boost (2026-07-10): p.data.lastReceivedEmail /
+-- lastReceivedText / lastReceivedInboxAppMessage are FUB fields for when a
+-- contact last messaged the team back -- a signal of live engagement that
+-- vw_person_fingerprints can't see, since it only knows property-browsing
+-- events. comms_boost multiplies engagement_intensity by up to
+-- (1 + comms_boost_weight), decaying by half every comms_half_life_days
+-- since the most recent of the three timestamps.
+--
+-- Pond name (2026-07-10): p.data.assignedPondId (INT64-as-string via
+-- JSON_VALUE) references a pond defined in
+-- jbg-fub-mirror.fub_mirror_ponds.ponds_raw_changelog, a Firestore
+-- change-stream export (columns: timestamp, event_id, document_name,
+-- operation, data, old_data, document_id) rather than a current-state
+-- table -- document_id holds the pond id and can carry many historical
+-- rows per pond as it's renamed/edited, so latest_ponds picks each
+-- document_id's most recent row by timestamp. A trailing DELETE leaves
+-- `data` NULL, so the name falls back to old_data to still surface the
+-- last known pond name rather than a blank.
 
 -- Parameters (set these before running):
 -- @target_price      INT64
@@ -30,7 +49,10 @@
 -- @limit             INT64         -- e.g. 25
 
 WITH constants AS (
-  SELECT 3.0 AS account_age_grace_days  -- days for a new contact to reach full weight
+  SELECT
+    3.0 AS account_age_grace_days,  -- days for a new contact to reach full weight
+    14.0 AS comms_half_life_days,   -- days for the recent-comms boost to decay by half
+    0.5 AS comms_boost_weight       -- max fractional boost to engagement_intensity from recent comms
 ),
 exploded AS (
   SELECT
@@ -110,6 +132,20 @@ person_scores AS (
   WHERE event_score > 0
   GROUP BY 1, 2
 ),
+latest_ponds AS (
+  SELECT
+    document_id,
+    COALESCE(JSON_VALUE(data, '$.name'), JSON_VALUE(old_data, '$.name')) AS pond_name
+  FROM (
+    SELECT
+      document_id,
+      data,
+      old_data,
+      ROW_NUMBER() OVER (PARTITION BY document_id ORDER BY timestamp DESC) AS rn
+    FROM `jbg-fub-mirror.fub_mirror_ponds.ponds_raw_changelog`
+  )
+  WHERE rn = 1
+),
 -- Join to names/stage before ranking so an excluded stage (e.g. Trash) can't
 -- occupy one of the top-N slots and shrink the usable result count below @limit.
 matches AS (
@@ -132,24 +168,48 @@ matches AS (
       )),
       1.0
     ) AS account_age_ramp,
+    -- Comms recency boost: a contact who recently emailed/texted/messaged
+    -- the team back is showing live engagement outside of property
+    -- browsing, so give engagement_intensity a decaying boost on top of it.
+    -- Same EXP(-LN(2)*days/half_life) decay used for event recency in
+    -- vw_person_fingerprints.sql. No comms on record decays toward a
+    -- ~1970 timestamp, so the boost underflows to 0 (fails open to no
+    -- boost, not a penalty) rather than needing a separate NULL branch.
+    1 + c.comms_boost_weight * EXP(
+      -LN(2)
+      * TIMESTAMP_DIFF(
+          CURRENT_TIMESTAMP(),
+          GREATEST(
+            COALESCE(SAFE_CAST(JSON_VALUE(p.data, '$.lastReceivedEmail')           AS TIMESTAMP), TIMESTAMP('1970-01-01')),
+            COALESCE(SAFE_CAST(JSON_VALUE(p.data, '$.lastReceivedText')            AS TIMESTAMP), TIMESTAMP('1970-01-01')),
+            COALESCE(SAFE_CAST(JSON_VALUE(p.data, '$.lastReceivedInboxAppMessage') AS TIMESTAMP), TIMESTAMP('1970-01-01'))
+          ),
+          DAY
+        )
+      / c.comms_half_life_days
+    ) AS comms_boost,
     JSON_VALUE(p.data, '$.firstName')  AS first_name,
     JSON_VALUE(p.data, '$.lastName')   AS last_name,
     JSON_VALUE(p.data, '$.stage')      AS stage,
-    JSON_VALUE(p.data, '$.assignedTo') AS assigned_agent
+    JSON_VALUE(p.data, '$.assignedTo') AS assigned_agent,
+    pond.pond_name                     AS pond_name
   FROM person_scores ps
   CROSS JOIN constants c
   LEFT JOIN `jbg-fub-mirror.fub_mirror_people.mirror_people_raw_latest` p
     ON JSON_VALUE(p.data, '$.id') = ps.person_id
+  LEFT JOIN latest_ponds pond
+    ON pond.document_id = JSON_VALUE(p.data, '$.assignedPondId')
   WHERE LOWER(COALESCE(JSON_VALUE(p.data, '$.stage'), '')) NOT IN (
     'trash', 'lead', 'attempted contact', 'under contract'
   )
 )
 SELECT
-  attribute_overlap * LN(1 + engagement_intensity * account_age_ramp) AS match_score,
+  attribute_overlap * LN(1 + engagement_intensity * account_age_ramp * comms_boost) AS match_score,
   first_name,
   last_name,
   stage,
   assigned_agent,
+  pond_name,
   CONCAT('https://jillkbiggs.followupboss.com/2/people/view/', person_id) AS profile_url
 FROM matches
 ORDER BY match_score DESC
